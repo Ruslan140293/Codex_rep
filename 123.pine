@@ -1,0 +1,173 @@
+//@version=6
+indicator("Structure • OB • FVG • BOS/CHoCH (HTF/LTF) — v6.4", overlay=true, max_labels_count=500, max_boxes_count=500)
+
+//================= INPUTS =================
+grpStruct   = "Structure (HH/HL/LH/LL)"
+mode        = input.string("3 bars", "Pivot mode", options = ["3 bars","5 bars"], group=grpStruct)
+pivotLen    = mode == "3 bars" ? 1 : 2   // 3 бара = 1/1, 5 баров = 2/2
+showStruct  = input.bool(true, "Show HH/HL/LH/LL", group=grpStruct)
+
+grpTF       = "Multi-Timeframe (MTF)"
+ltfTF       = input.timeframe("", "LTF timeframe (empty = current)", group=grpTF)
+htfTF       = input.timeframe("240", "HTF timeframe", group=grpTF)
+showLTF     = input.bool(true, "Draw LTF signals", group=grpTF)
+showHTF     = input.bool(true, "Draw HTF signals", group=grpTF)
+
+grpOB       = "Order Blocks"
+showOB      = input.bool(true, "Show Order Blocks", group=grpOB)
+obLifeBars  = input.int(10, "OB lifetime (bars)", minval=1, maxval=50, group=grpOB)
+
+grpFVG      = "Imbalance (FVG)"
+showFVG     = input.bool(true, "Show Fair Value Gaps", group=grpFVG)
+fvgLifeBars = input.int(10, "FVG lifetime (bars)", minval=1, maxval=50, group=grpFVG)
+
+grpBOS      = "BOS / CHoCH"
+showBOS     = input.bool(true, "Show BOS", group=grpBOS)
+showCHOCH   = input.bool(true, "Show CHoCH", group=grpBOS)
+
+//================= COLORS =================
+colHH = color.new(color.lime,   0)
+colHL = color.new(color.teal,   0)
+colLH = color.new(color.orange, 0)
+colLL = color.new(color.red,    0)
+
+colOBBull = color.new(color.teal,   80)
+colOBBear = color.new(color.orange, 80)
+colFVGUp  = color.new(color.lime,   80)
+colFVGDown= color.new(color.red,    80)
+
+colBOSUp    = color.new(color.lime, 0)
+colBOSDown  = color.new(color.red,  0)
+colCHOCHUp  = color.new(color.blue, 0)
+colCHOCHDown= color.new(color.purple, 0)
+
+//================= UTILS =================
+f_lbl(_x, _y, _txt, _clr) =>
+    label.new(_x, _y, _txt, style=label.style_label_center, textcolor=color.white, color=_clr, size=size.tiny)
+
+// pivots on each bar via request.security (no branching)
+f_pivots_on_tf(_tf, _pl) =>
+    string tf = (na(_tf) or str.length(_tf) == 0) ? timeframe.period : _tf
+    float ph = request.security(syminfo.tickerid, tf, ta.pivothigh(high, _pl, _pl), barmerge.gaps_off, barmerge.lookahead_off)
+    float pl = request.security(syminfo.tickerid, tf, ta.pivotlow(low,  _pl, _pl), barmerge.gaps_off, barmerge.lookahead_off)
+    [ph, pl]
+
+// Draw FVG lasting N bars
+f_draw_fvg(_leftBarIndex, _top, _bot, _life, _isBull) =>
+    int left  = _leftBarIndex
+    int right = left + _life
+    box.new(left, _top, right, _bot, bgcolor=_isBull ? colFVGUp : colFVGDown, border_color=_isBull ? color.new(color.lime, 0) : color.new(color.red, 0))
+
+// BOS/CHoCH helper -> returns (bosUp, bosDown, newTrend)
+f_bos_choch(_lastHigh, _lastLow, _trendIn) =>
+    int trend = _trendIn
+    bool bosUp   = not na(_lastHigh) and close > _lastHigh
+    bool bosDown = not na(_lastLow)  and close < _lastLow
+    bool isCHOCHUp = bosUp   and trend !=  1
+    bool isCHOCHDn = bosDown and trend != -1
+    if bosUp
+        if isCHOCHUp and showCHOCH
+            f_lbl(bar_index, high, "CHoCH ↑", colCHOCHUp)
+        if not isCHOCHUp and showBOS
+            f_lbl(bar_index, high, "BOS ↑", colBOSUp)
+        trend := 1
+    if bosDown
+        if isCHOCHDn and showCHOCH
+            f_lbl(bar_index, low, "CHoCH ↓", colCHOCHDown)
+        if not isCHOCHDn and showBOS
+            f_lbl(bar_index, low, "BOS ↓", colBOSDown)
+        trend := -1
+    [bosUp, bosDown, trend]
+
+// Plot OB of opposite candle lasting N bars
+f_plot_ob(_isBullBreak, _life) =>
+    if showOB
+        int lookback = 30
+        for i = 1 to lookback
+            bool isOpp = _isBullBreak ? (close[i] < open[i]) : (close[i] > open[i])
+            if isOpp
+                int left = bar_index - i
+                float top = _isBullBreak ? open[i]  : close[i]
+                float bot = _isBullBreak ? close[i] : open[i]
+                box.new(left, top, left + _life, bot, bgcolor=_isBullBreak ? colOBBull : colOBBear, border_color=_isBullBreak ? color.new(color.teal, 0) : color.new(color.orange, 0))
+                break
+
+//================= LTF =================
+[phLTF, plLTF] = f_pivots_on_tf(ltfTF, pivotLen)
+var float lastSwingHighLTF = na
+var float lastSwingLowLTF  = na
+var int   trendLTF         = 0   // +1 bull, −1 bear, 0 unknown
+
+// память для класификации HH/HL/LH/LL на LTF
+var float lastPH_LTF = na
+var float lastPL_LTF = na
+
+// Отрисовка структуры LTF (без кортежей)
+if showLTF
+    if not na(phLTF)
+        string keyH = na(lastPH_LTF) ? "H" : (phLTF > lastPH_LTF ? "HH" : "LH")
+        if showStruct
+            f_lbl(bar_index - pivotLen, phLTF, "LTF " + keyH, keyH == "HH" ? colHH : colLH)
+        lastPH_LTF := phLTF
+    if not na(plLTF)
+        string keyL = na(lastPL_LTF) ? "L" : (plLTF > lastPL_LTF ? "HL" : "LL")
+        if showStruct
+            f_lbl(bar_index - pivotLen, plLTF, "LTF " + keyL, keyL == "HL" ? colHL : colLL)
+        lastPL_LTF := plLTF
+
+// Обновление свингов (без перерисовки — после подтверждения)
+lastSwingHighLTF := na(phLTF) ? lastSwingHighLTF : phLTF
+lastSwingLowLTF  := na(plLTF) ? lastSwingLowLTF  : plLTF
+
+// BOS / CHoCH на LTF
+[bosUpLTF_new, bosDnLTF_new, trendLTF_new] = f_bos_choch(lastSwingHighLTF, lastSwingLowLTF, trendLTF)
+trendLTF := trendLTF_new
+
+// OB на LTF
+if bosUpLTF_new
+    f_plot_ob(true, obLifeBars)
+if bosDnLTF_new
+    f_plot_ob(false, obLifeBars)
+
+// FVG (3-свечный), живёт fvgLifeBars
+if showFVG and bar_index > 2
+    bool bullFVG = low > high[2]
+    bool bearFVG = high < low[2]
+    if bullFVG
+        f_draw_fvg(bar_index - 2, high[2], low, fvgLifeBars, true)
+    if bearFVG
+        f_draw_fvg(bar_index - 2, high, low[2], fvgLifeBars, false)
+
+//================= HTF =================
+[phHTF, plHTF] = f_pivots_on_tf(htfTF, pivotLen)
+var float lastSwingHighHTF = na
+var float lastSwingLowHTF  = na
+var int   trendHTF         = 0
+
+// память для класификации HH/HL/LH/LL на HTF
+var float lastPH_HTF = na
+var float lastPL_HTF = na
+
+if showHTF
+    if not na(phHTF)
+        string keyHh = na(lastPH_HTF) ? "H" : (phHTF > lastPH_HTF ? "HH" : "LH")
+        if showStruct
+            f_lbl(bar_index - pivotLen, phHTF, "HTF " + keyHh, keyHh == "HH" ? colHH : colLH)
+        lastPH_HTF := phHTF
+    if not na(plHTF)
+        string keyLl = na(lastPL_HTF) ? "L" : (plHTF > lastPL_HTF ? "HL" : "LL")
+        if showStruct
+            f_lbl(bar_index - pivotLen, plHTF, "HTF " + keyLl, keyLl == "HL" ? colHL : colLL)
+        lastPL_HTF := plHTF
+
+lastSwingHighHTF := na(phHTF) ? lastSwingHighHTF : phHTF
+lastSwingLowHTF  := na(plHTF) ? lastSwingLowHTF  : plHTF
+
+[bosUpHTF_new, bosDnHTF_new, trendHTF_new] = f_bos_choch(lastSwingHighHTF, lastSwingLowHTF, trendHTF)
+trendHTF := trendHTF_new
+
+// OB на HTF
+if bosUpHTF_new
+    f_plot_ob(true, obLifeBars)
+if bosDnHTF_new
+    f_plot_ob(false, obLifeBars)
